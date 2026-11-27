@@ -175,7 +175,7 @@ static NSArray<UITouch*>* activeTouches(UIEvent* event) {
     if (!multiTouch) {
         multiTouch = YES;
         scrolled = NO;
-        multiStartTime = [[touches anyObject] timestamp];
+        multiStartTime = ((UITouch*)[touches anyObject]).timestamp;
         scrollRemainderX = scrollRemainderY = 0;
     }
     maxTouches = MAX(maxTouches, active.count);
