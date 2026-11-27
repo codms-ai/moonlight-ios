@@ -29,6 +29,13 @@
 - (NSURLRequest*) newLaunchOrResumeRequest:(NSString*)verb config:(StreamConfiguration*)config;
 - (NSURLRequest*) newQuitAppRequest;
 - (NSURLRequest*) newAppAssetRequestWithAppId:(NSString*)appId;
+
+// Apollo clipboard extension (text only, only while streaming).
+// Responses are raw text, not XML, so send these with your own NSURLSession
+// using this HttpManager as the session delegate (it handles the TLS pinning
+// and client certificate) instead of executeRequestSynchronously.
+- (NSURLRequest*) newGetClipboardRequest;
+- (NSURLRequest*) newSetClipboardRequest:(NSData*)utf8Text;
 - (void) executeRequestSynchronously:(HttpRequest*)request;
 
 @end

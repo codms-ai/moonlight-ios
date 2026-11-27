@@ -304,6 +304,28 @@
     return [self createRequestFromString:urlString timeout:NORMAL_TIMEOUT_SEC];
 }
 
+- (NSURLRequest*) newGetClipboardRequest {
+    if (!_baseHTTPSURL) {
+        return nil;
+    }
+
+    NSString* urlString = [NSString stringWithFormat:@"%@/actions/clipboard?type=text&uniqueid=%@", _baseHTTPSURL, _uniqueId];
+    return [self createRequestFromString:urlString timeout:SHORT_TIMEOUT_SEC];
+}
+
+- (NSURLRequest*) newSetClipboardRequest:(NSData*)utf8Text {
+    if (!_baseHTTPSURL) {
+        return nil;
+    }
+
+    NSString* urlString = [NSString stringWithFormat:@"%@/actions/clipboard?type=text&uniqueid=%@", _baseHTTPSURL, _uniqueId];
+    NSMutableURLRequest* request = [[self createRequestFromString:urlString timeout:NORMAL_TIMEOUT_SEC] mutableCopy];
+    request.HTTPMethod = @"POST";
+    request.HTTPBody = utf8Text;
+    [request setValue:@"text/plain; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
+    return request;
+}
+
 - (NSString*) bytesToHex:(NSData*)data {
     const unsigned char* bytes = [data bytes];
     NSMutableString *hex = [[NSMutableString alloc] init];

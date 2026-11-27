@@ -30,6 +30,217 @@
 - (id)initWithRefreshRate:(float)arg1 videoDynamicRange:(int)arg2;
 @end
 
+#if !TARGET_OS_TV
+#import "HttpManager.h"
+
+// ---------------------------------------------------------------------------
+// Pad Display: two-way text clipboard sync while streaming.
+//
+// Uses Apollo's /actions/clipboard API (GET = read the PC clipboard,
+// POST = set it). Once a second we either push a new iPad clipboard to the PC
+// or poll the PC clipboard. Only changes made after the stream starts are
+// synced, so connecting never overwrites what is already on either side.
+// Plain Sunshine/GFE hosts answer 404 and we just back off quietly.
+// ---------------------------------------------------------------------------
+#define CLIPBOARD_POLL_INTERVAL_SEC 1.0
+#define CLIPBOARD_MAX_BYTES (1024 * 1024)
+
+@interface PadClipboardSync : NSObject
+- (instancetype)initWithConfig:(StreamConfiguration*)config;
+- (void)start;
+- (void)stop;
+@end
+
+@implementation PadClipboardSync {
+    HttpManager* _httpManager;
+    NSURLSession* _session;
+    dispatch_queue_t _queue;
+    dispatch_source_t _timer;
+
+    // Everything below is only touched on _queue
+    NSString* _lastSyncedText;   // text we know is on both sides
+    NSInteger _lastChangeCount;  // iPad pasteboard changeCount we've handled
+    BOOL _primed;                // first PC read only sets the baseline
+    BOOL _requestInFlight;
+    BOOL _stopped;
+    NSTimeInterval _backoffUntil;
+    BOOL _loggedPermission;
+}
+
+- (instancetype)initWithConfig:(StreamConfiguration*)config {
+    self = [super init];
+    if (self) {
+        _httpManager = [[HttpManager alloc] initWithAddress:config.host
+                                                  httpsPort:config.httpsPort
+                                                 serverCert:config.serverCert];
+        NSURLSessionConfiguration* sessionConfig = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+        sessionConfig.timeoutIntervalForRequest = 5;
+        sessionConfig.HTTPMaximumConnectionsPerHost = 1;
+        // The HttpManager pins the PC's certificate and answers the client
+        // certificate challenge, exactly like the rest of Moonlight's requests.
+        // Reusing one session keeps the TLS connection alive between polls.
+        _session = [NSURLSession sessionWithConfiguration:sessionConfig delegate:_httpManager delegateQueue:nil];
+        _queue = dispatch_queue_create("PadClipboardSync", DISPATCH_QUEUE_SERIAL);
+    }
+    return self;
+}
+
+// Call on the main thread
+- (void)start {
+    NSInteger changeCount = [UIPasteboard generalPasteboard].changeCount;
+    dispatch_async(_queue, ^{
+        self->_lastChangeCount = changeCount;
+    });
+
+    _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _queue);
+    dispatch_source_set_timer(_timer,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                              (uint64_t)(CLIPBOARD_POLL_INTERVAL_SEC * NSEC_PER_SEC),
+                              (uint64_t)(0.1 * NSEC_PER_SEC));
+    __weak PadClipboardSync* weakSelf = self;
+    dispatch_source_set_event_handler(_timer, ^{
+        [weakSelf tick];
+    });
+    dispatch_resume(_timer);
+    Log(LOG_I, @"Clipboard sync started");
+}
+
+- (void)stop {
+    if (_timer != nil) {
+        dispatch_source_cancel(_timer);
+        _timer = nil;
+    }
+    dispatch_async(_queue, ^{
+        if (!self->_stopped) {
+            self->_stopped = YES;
+            [self->_session invalidateAndCancel];
+            Log(LOG_I, @"Clipboard sync stopped");
+        }
+    });
+}
+
+- (void)tick {
+    if (_stopped || _requestInFlight || [NSDate timeIntervalSinceReferenceDate] < _backoffUntil) {
+        return;
+    }
+
+    // 1. iPad -> PC: has the iPad clipboard changed since we last looked?
+    // changeCount never triggers the iOS paste prompt; reading the string can,
+    // so we only read it when something actually changed.
+    __block BOOL active = NO;
+    __block NSInteger changeCount = 0;
+    __block NSString* localText = nil;
+    NSInteger handledChangeCount = _lastChangeCount;
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        active = [UIApplication sharedApplication].applicationState == UIApplicationStateActive;
+        if (!active) {
+            return;
+        }
+        UIPasteboard* pasteboard = [UIPasteboard generalPasteboard];
+        changeCount = pasteboard.changeCount;
+        if (changeCount != handledChangeCount && pasteboard.hasStrings) {
+            localText = pasteboard.string;
+        }
+    });
+    if (!active) {
+        return;
+    }
+
+    if (changeCount != _lastChangeCount) {
+        _lastChangeCount = changeCount;
+        if (localText.length > 0 && ![localText isEqualToString:_lastSyncedText]) {
+            NSData* body = [localText dataUsingEncoding:NSUTF8StringEncoding];
+            if (body.length <= CLIPBOARD_MAX_BYTES) {
+                _lastSyncedText = localText;
+                _primed = YES;
+                [self send:[_httpManager newSetClipboardRequest:body] isRead:NO];
+                return;
+            }
+        }
+    }
+
+    // 2. PC -> iPad: poll the PC clipboard
+    [self send:[_httpManager newGetClipboardRequest] isRead:YES];
+}
+
+- (void)send:(NSURLRequest*)request isRead:(BOOL)isRead {
+    if (request == nil || _session == nil) {
+        return;
+    }
+    _requestInFlight = YES;
+    NSURLSessionDataTask* task = [_session dataTaskWithRequest:request
+                                             completionHandler:^(NSData* data, NSURLResponse* response, NSError* error) {
+        dispatch_async(self->_queue, ^{
+            [self handleData:data response:response error:error isRead:isRead];
+        });
+    }];
+    [task resume];
+}
+
+- (void)handleData:(NSData*)data response:(NSURLResponse*)response error:(NSError*)error isRead:(BOOL)isRead {
+    _requestInFlight = NO;
+    if (_stopped) {
+        return;
+    }
+
+    NSInteger status = [response isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse*)response).statusCode : 0;
+    if (error != nil || status != 200) {
+        NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+        if (status == 401) {
+            if (!_loggedPermission) {
+                Log(LOG_W, @"Clipboard sync: no clipboard permission for this device in Apollo");
+                _loggedPermission = YES;
+            }
+            _backoffUntil = now + 10;
+        }
+        else if (status == 404 || status == 400) {
+            // Not an Apollo host (or an older one): check again rarely
+            _backoffUntil = now + 30;
+        }
+        else {
+            // 403 while the stream is still starting, timeouts, etc.
+            _backoffUntil = now + 2;
+        }
+        return;
+    }
+
+    if (!isRead) {
+        return;
+    }
+
+    if (data.length == 0 || data.length > CLIPBOARD_MAX_BYTES) {
+        _primed = YES;
+        return;
+    }
+    NSString* pcText = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (pcText == nil) {
+        return;
+    }
+    if (!_primed) {
+        // Whatever was on the PC before we connected stays there
+        _primed = YES;
+        _lastSyncedText = pcText;
+        return;
+    }
+    if ([pcText isEqualToString:_lastSyncedText]) {
+        return;
+    }
+
+    _lastSyncedText = pcText;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIPasteboard* pasteboard = [UIPasteboard generalPasteboard];
+        pasteboard.string = pcText;
+        NSInteger newChangeCount = pasteboard.changeCount;
+        dispatch_async(self->_queue, ^{
+            // Our own write must not be sent back to the PC
+            self->_lastChangeCount = newChangeCount;
+        });
+    });
+}
+
+@end
+#endif
+
 @implementation StreamFrameViewController {
     ControllerSupport *_controllerSupport;
     StreamManager *_streamMan;
@@ -50,6 +261,14 @@
     
 #if !TARGET_OS_TV
     UIScreenEdgePanGestureRecognizer *_exitSwipeRecognizer;
+    PadClipboardSync *_clipboardSync;
+#endif
+}
+
+- (void)stopClipboardSync {
+#if !TARGET_OS_TV
+    [_clipboardSync stop];
+    _clipboardSync = nil;
 #endif
 }
 
@@ -218,6 +437,7 @@
 - (void)willMoveToParentViewController:(UIViewController *)parent {
     // Only cleanup when we're being destroyed
     if (parent == nil) {
+        [self stopClipboardSync];
         [_controllerSupport cleanup];
         [UIApplication sharedApplication].idleTimerDisabled = NO;
         [_streamMan stopStream];
@@ -306,6 +526,8 @@
 }
 
 - (void) returnToMainFrame {
+    [self stopClipboardSync];
+
     // Reset display mode back to default
     [self updatePreferredDisplayMode:NO];
     
@@ -378,7 +600,14 @@
         [self->_streamView showOnScreenControls];
         
         [self->_controllerSupport connectionEstablished];
-        
+
+#if !TARGET_OS_TV
+        // Pad Display: share the text clipboard with the PC while connected
+        [self stopClipboardSync];
+        self->_clipboardSync = [[PadClipboardSync alloc] initWithConfig:self.streamConfig];
+        [self->_clipboardSync start];
+#endif
+
         if (self->_settings.statsOverlay) {
             self->_statsUpdateTimer = [NSTimer scheduledTimerWithTimeInterval:1.0f
                                                                        target:self
@@ -394,8 +623,10 @@
     
     unsigned int portFlags = LiGetPortFlagsFromTerminationErrorCode(errorCode);
     unsigned int portTestResults = LiTestClientConnectivity(CONN_TEST_SERVER, 443, portFlags);
-    
+
     dispatch_async(dispatch_get_main_queue(), ^{
+        [self stopClipboardSync];
+
         // Allow the display to go to sleep now
         [UIApplication sharedApplication].idleTimerDisabled = NO;
         
