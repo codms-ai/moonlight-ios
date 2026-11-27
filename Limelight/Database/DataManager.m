@@ -153,13 +153,48 @@
         // create a new settings object with the default values
         NSEntityDescription* entity = [NSEntityDescription entityForName:@"Settings" inManagedObjectContext:_managedObjectContext];
         Settings* settings = [[Settings alloc] initWithEntity:entity insertIntoManagedObjectContext:_managedObjectContext];
-        
+
+#if !TARGET_OS_TV
+        [self applyDisplayModeDefaults:settings];
+#endif
+
         return settings;
     } else {
         // we should only ever have 1 settings object stored
         return [fetchedRecords objectAtIndex:0];
     }
 }
+
+#if !TARGET_OS_TV
+// Display mode: first-launch defaults tuned for using the iPad as a second
+// monitor instead of a game screen. Every value can still be changed in Settings.
+- (void) applyDisplayModeDefaults:(Settings*)settings {
+    // This can run inside a Core Data block on any thread, so never dispatch_sync
+    // to the main queue here (it could deadlock). UIScreen's size is safe to read.
+    UIScreen* screen = [UIScreen mainScreen];
+    CGFloat scale = screen.scale;
+    CGFloat a = screen.bounds.size.width * scale;
+    CGFloat b = screen.bounds.size.height * scale;
+    // Always landscape: the virtual monitor on the PC is landscape
+    CGSize screenSize = CGSizeMake(MAX(a, b), MIN(a, b));
+    NSInteger maxFps = 60;
+    if (@available(iOS 10.3, *)) {
+        maxFps = screen.maximumFramesPerSecond;
+    }
+
+    BOOL highRefresh = maxFps > 62;
+    settings.width = [NSNumber numberWithInteger:(NSInteger)screenSize.width];
+    settings.height = [NSNumber numberWithInteger:(NSInteger)screenSize.height];
+    settings.framerate = [NSNumber numberWithInteger:highRefresh ? 120 : 60];
+    settings.bitrate = [NSNumber numberWithInteger:highRefresh ? 60000 : 40000];
+    settings.absoluteTouchMode = YES;      // the finger is the cursor
+    settings.onscreenControls = [NSNumber numberWithInteger:0]; // no gamepad overlay
+    settings.optimizeGames = NO;           // don't let the host change game settings
+    settings.playAudioOnPC = YES;          // sound stays on the laptop speakers
+    settings.useFramePacing = NO;          // show frames as soon as they are decoded
+    settings.statsOverlay = NO;
+}
+#endif
 
 - (void) removeApp:(TemporaryApp*)app {
     [_managedObjectContext performBlockAndWait:^{

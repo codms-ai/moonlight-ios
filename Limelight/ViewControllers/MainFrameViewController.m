@@ -203,7 +203,9 @@ static NSMutableSet* hostList;
                 [self updateAppsForHost:host];
                 [self->_appManager stopRetrieving];
                 [self->_appManager retrieveAssetsFromHost:host];
-                [self hideLoadingFrame: nil];
+                [self hideLoadingFrame: ^{
+                    [self autoLaunchDesktopForHost:host];
+                }];
             });
         }
     });
@@ -859,6 +861,60 @@ static NSMutableSet* hostList;
         [self prepareToStreamApp:app];
         [self performSegueWithIdentifier:@"createStreamFrame" sender:nil];
     }
+}
+
+// Display mode: once per app launch, go straight to the PC's desktop stream.
+// Apollo names its virtual-monitor app "Virtual Display"/"Virtual Desktop";
+// plain Sunshine has "Desktop". After the user disconnects they stay on the
+// app list (we only do this once per launch), so it never loops.
+static BOOL autoLaunchAttempted = NO;
+
+- (TemporaryApp*) findDesktopApp:(TemporaryHost*)host {
+    NSArray* preferred = @[@"virtual display", @"virtual desktop", @"desktop"];
+    for (NSString* name in preferred) {
+        for (TemporaryApp* app in host.appList) {
+            if ([[app.name lowercaseString] isEqualToString:name]) {
+                return app;
+            }
+        }
+    }
+    for (TemporaryApp* app in host.appList) {
+        if ([[app.name lowercaseString] containsString:@"desktop"]) {
+            return app;
+        }
+    }
+    return nil;
+}
+
+- (void) autoLaunchDesktopForHost:(TemporaryHost*)host {
+#if !TARGET_OS_TV
+    if (autoLaunchAttempted || _background || host != _selectedHost ||
+        host.pairState != PairStatePaired || self.presentedViewController != nil ||
+        self.navigationController.topViewController != self) {
+        return;
+    }
+
+    TemporaryApp* desktop = [self findDesktopApp:host];
+    if (desktop == nil) {
+        return;
+    }
+    autoLaunchAttempted = YES;
+
+    TemporaryApp* running = [self findRunningApp:host];
+    if (running != nil && ![running.id isEqualToString:desktop.id]) {
+        // Something else (a game) is running on the PC: let the user decide
+        Log(LOG_I, @"Not auto-launching: %@ is running", running.name);
+        return;
+    }
+
+    Log(LOG_I, @"Auto-launching %@", desktop.name);
+    [_appManager stopRetrieving];
+    if (currentPosition != FrontViewPositionLeft) {
+        [[self revealViewController] revealToggleAnimated:NO];
+    }
+    [self prepareToStreamApp:running != nil ? running : desktop];
+    [self performSegueWithIdentifier:@"createStreamFrame" sender:nil];
+#endif
 }
 
 - (TemporaryApp*) findRunningApp:(TemporaryHost*)host {
