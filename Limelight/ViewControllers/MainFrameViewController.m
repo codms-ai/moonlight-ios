@@ -891,7 +891,13 @@ static BOOL autoLaunchAttempted = NO;
 
 - (void) autoLaunchDesktopForHost:(TemporaryHost*)host {
 #if !TARGET_OS_TV
-    if (autoLaunchAttempted || _background || host != _selectedHost ||
+    // Launch once per app start, and again whenever the last stream only ended
+    // because the user switched to another app. Never while in the background
+    // (the app list can finish loading just as we're being suspended).
+    BOOL resuming = PadResumeStreamOnForeground;
+    if ((autoLaunchAttempted && !resuming) || _background ||
+        [UIApplication sharedApplication].applicationState != UIApplicationStateActive ||
+        host != _selectedHost ||
         host.pairState != PairStatePaired || self.presentedViewController != nil ||
         self.navigationController.topViewController != self) {
         return;
@@ -902,6 +908,7 @@ static BOOL autoLaunchAttempted = NO;
         return;
     }
     autoLaunchAttempted = YES;
+    PadResumeStreamOnForeground = NO;
 
     TemporaryApp* running = [self findRunningApp:host];
     if (running != nil && ![running.id isEqualToString:desktop.id]) {

@@ -24,3 +24,8 @@
 -(void)updatePreferredDisplayMode:(BOOL)streamActive;
 
 @end
+
+// Pad Display: set when the stream ended only because the app went to the
+// background (e.g. switching to another app to copy something), so the main
+// screen reconnects by itself when the app comes back.
+extern BOOL PadResumeStreamOnForeground;

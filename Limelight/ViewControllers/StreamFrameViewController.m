@@ -30,6 +30,8 @@
 - (id)initWithRefreshRate:(float)arg1 videoDynamicRange:(int)arg2;
 @end
 
+BOOL PadResumeStreamOnForeground = NO;
+
 #if !TARGET_OS_TV
 #import "HttpManager.h"
 
@@ -38,12 +40,15 @@
 //
 // Uses Apollo's /actions/clipboard API (GET = read the PC clipboard,
 // POST = set it). Once a second we either push a new iPad clipboard to the PC
-// or poll the PC clipboard. Only changes made after the stream starts are
-// synced, so connecting never overwrites what is already on either side.
+// or poll the PC clipboard. The PC clipboard from before we connected is
+// left alone, but something copied on the iPad while we were disconnected
+// (e.g. in another app) is sent as soon as we reconnect: the last iPad
+// changeCount we handled is remembered across streams.
 // Plain Sunshine/GFE hosts answer 404 and we just back off quietly.
 // ---------------------------------------------------------------------------
 #define CLIPBOARD_POLL_INTERVAL_SEC 1.0
 #define CLIPBOARD_MAX_BYTES (1024 * 1024)
+#define CLIPBOARD_CHANGE_COUNT_KEY @"PadClipboardHandledChangeCount"
 
 @interface PadClipboardSync : NSObject
 - (instancetype)initWithConfig:(StreamConfiguration*)config;
@@ -65,6 +70,16 @@
     BOOL _stopped;
     NSTimeInterval _backoffUntil;
     BOOL _loggedPermission;
+
+    // iPad text being sent; committed to _lastChangeCount only once the PC accepts it
+    NSString* _pendingText;
+    NSInteger _pendingChangeCount;
+}
+
+// Only call on _queue
+- (void)setHandledChangeCount:(NSInteger)changeCount {
+    _lastChangeCount = changeCount;
+    [[NSUserDefaults standardUserDefaults] setInteger:changeCount forKey:CLIPBOARD_CHANGE_COUNT_KEY];
 }
 
 - (instancetype)initWithConfig:(StreamConfiguration*)config {
@@ -87,9 +102,21 @@
 
 // Call on the main thread
 - (void)start {
+    // The pasteboard changeCount is system-wide and only goes up (until the
+    // iPad restarts). If it moved since the last change we handled, the user
+    // copied something while we were disconnected: send it on the first tick.
     NSInteger changeCount = [UIPasteboard generalPasteboard].changeCount;
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    NSInteger handled = changeCount;
+    if ([defaults objectForKey:CLIPBOARD_CHANGE_COUNT_KEY] != nil) {
+        handled = [defaults integerForKey:CLIPBOARD_CHANGE_COUNT_KEY];
+        if (handled > changeCount) {
+            // The iPad restarted since then; don't guess
+            handled = changeCount;
+        }
+    }
     dispatch_async(_queue, ^{
-        self->_lastChangeCount = changeCount;
+        [self setHandledChangeCount:handled];
     });
 
     _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _queue);
@@ -147,16 +174,18 @@
     }
 
     if (changeCount != _lastChangeCount) {
-        _lastChangeCount = changeCount;
-        if (localText.length > 0 && ![localText isEqualToString:_lastSyncedText]) {
-            NSData* body = [localText dataUsingEncoding:NSUTF8StringEncoding];
-            if (body.length <= CLIPBOARD_MAX_BYTES) {
-                _lastSyncedText = localText;
-                _primed = YES;
-                [self send:[_httpManager newSetClipboardRequest:body] isRead:NO];
-                return;
-            }
+        NSData* body = [localText dataUsingEncoding:NSUTF8StringEncoding];
+        if (localText.length > 0 && ![localText isEqualToString:_lastSyncedText] &&
+            body.length <= CLIPBOARD_MAX_BYTES) {
+            // Commit only when the PC accepts it, so a failed send (e.g. the
+            // session is still starting) is retried on the next tick
+            _pendingText = localText;
+            _pendingChangeCount = changeCount;
+            [self send:[_httpManager newSetClipboardRequest:body] isRead:NO];
+            return;
         }
+        // Nothing to send (an image, empty, too big, or already synced)
+        [self setHandledChangeCount:changeCount];
     }
 
     // 2. PC -> iPad: poll the PC clipboard
@@ -184,6 +213,20 @@
     }
 
     NSInteger status = [response isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse*)response).statusCode : 0;
+
+    if (!isRead) {
+        NSString* sent = _pendingText;
+        NSInteger sentChangeCount = _pendingChangeCount;
+        _pendingText = nil;
+        if (error == nil && status == 200 && sent != nil) {
+            _lastSyncedText = sent;
+            _primed = YES;
+            [self setHandledChangeCount:sentChangeCount];
+            Log(LOG_I, @"Clipboard sync: sent iPad clipboard to PC");
+        }
+        // On failure the changeCount stays unhandled, so the next tick retries
+    }
+
     if (error != nil || status != 200) {
         NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
         if (status == 401) {
@@ -233,7 +276,7 @@
         NSInteger newChangeCount = pasteboard.changeCount;
         dispatch_async(self->_queue, ^{
             // Our own write must not be sent back to the PC
-            self->_lastChangeCount = newChangeCount;
+            [self setHandledChangeCount:newChangeCount];
         });
     });
 }
@@ -575,6 +618,9 @@
 - (void)applicationDidEnterBackground:(UIApplication *)application {
     Log(LOG_I, @"Terminating stream immediately for backgrounding");
 
+    // Reconnect automatically when the user comes back
+    PadResumeStreamOnForeground = YES;
+
     if (_inactivityTimer != nil) {
         [_inactivityTimer invalidate];
         _inactivityTimer = nil;
@@ -585,12 +631,16 @@
 
 - (void)edgeSwiped {
     Log(LOG_I, @"User swiped to end stream");
-    
+
+    // The user chose to disconnect: stay on the app list
+    PadResumeStreamOnForeground = NO;
+
     [self returnToMainFrame];
 }
 
 - (void) connectionStarted {
     Log(LOG_I, @"Connection started");
+    PadResumeStreamOnForeground = NO;
     dispatch_async(dispatch_get_main_queue(), ^{
         // Leave the spinner spinning until it's obscured by
         // the first frame of video.
