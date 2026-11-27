@@ -27,8 +27,8 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Download iOS platform
-        run: xcodebuild -downloadPlatform iOS
+      # No "xcodebuild -downloadPlatform" step: that only fetches simulator
+      # runtimes (and fails on some runners). The iphoneos SDK ships with Xcode.
 
       - name: Build for device (no signing)
         run: |
