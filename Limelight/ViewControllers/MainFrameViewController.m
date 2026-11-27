@@ -864,13 +864,16 @@ static NSMutableSet* hostList;
 }
 
 // Display mode: once per app launch, go straight to the PC's desktop stream.
-// Apollo names its virtual-monitor app "Virtual Display"/"Virtual Desktop";
-// plain Sunshine has "Desktop". After the user disconnects they stay on the
-// app list (we only do this once per launch), so it never loops.
+// "Pad Display" is an Apollo app we add with virtual-display and
+// terminate-on-pause on, so the iPad monitor disappears from Windows as soon
+// as the iPad disconnects (Apollo's built-in "Virtual Display" keeps it).
+// Then Apollo's "Virtual Display"/"Virtual Desktop", then Sunshine's "Desktop".
+// After the user disconnects they stay on the app list (we only do this once
+// per launch), so it never loops.
 static BOOL autoLaunchAttempted = NO;
 
 - (TemporaryApp*) findDesktopApp:(TemporaryHost*)host {
-    NSArray* preferred = @[@"virtual display", @"virtual desktop", @"desktop"];
+    NSArray* preferred = @[@"pad display", @"virtual display", @"virtual desktop", @"desktop"];
     for (NSString* name in preferred) {
         for (TemporaryApp* app in host.appList) {
             if ([[app.name lowercaseString] isEqualToString:name]) {
